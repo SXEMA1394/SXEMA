@@ -4,8 +4,6 @@ import time
 import threading
 import traceback
 import requests
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
 from flask import Flask, Response, render_template_string, request, jsonify
 
 CONFIG_FILE = "config.json"
@@ -59,6 +57,17 @@ def load_cached_items():
 def save_cached_items(items):
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
+
+def escape_xml(text):
+    """Экранирование спецсимволов для XML"""
+    if text is None:
+        return ""
+    text = str(text)
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("'", "&apos;"))
 
 # ================= КЛИЕНТ X2POS API =================
 class X2PosClient:
@@ -157,7 +166,7 @@ def run_full_sync():
                                 qty = float(row.get("quantity") or 0)
                                 stock_map[v_id] = stock_map.get(v_id, 0.0) + qty
             except Exception as e:
-                print(f"[SYNC WARNING] Не удалось загрузить остатки филиала {b_id}: {e}")
+                print(f"[SYNC WARNING] Ошибка загрузки остатков филиала {b_id}: {e}")
 
         raw_products = client.get_products()
         items = []
@@ -215,7 +224,7 @@ def run_full_sync():
         is_syncing = False
         sync_lock.release()
 
-# ================= ГЕНЕРАЦИЯ ВАЛИДНОГО KASPI XML =================
+# ================= ВАЛИДНЫЙ ГЕНЕРАТОР KASPI XML =================
 def build_kaspi_xml():
     cfg = load_config()
     items = load_cached_items()
@@ -227,20 +236,16 @@ def build_kaspi_xml():
     warehouses = cfg.get("kaspi_warehouses", [])
     exclude_zero = cfg.get("exclude_zero_stock", False)
 
-    # Строгое соответствие XSD-схеме Kaspi Goods
-    root = ET.Element("kaspi_catalog", {
-        "date": "string",
-        "xmlns": "kaspi_catalog",
-        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
-        "xsi:schemaLocation": "kaspi_catalog kaspi_catalog.xsd"
-    })
-    
-    company = ET.SubElement(root, "company")
-    company.text = cfg.get("company_name", "Kaspi Store")
-    merchantid = ET.SubElement(root, "merchantid")
-    merchantid.text = cfg.get("merchant_id", "MERCHANT_ID")
+    company_name = escape_xml(cfg.get("company_name", "Kaspi Store"))
+    merchant_id = escape_xml(cfg.get("merchant_id", "MERCHANT_ID"))
 
-    offers = ET.SubElement(root, "offers")
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<kaspi_catalog date="string" xmlns="kaspi_catalog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="kaspi_catalog kaspi_catalog.xsd">',
+        f'  <company>{company_name}</company>',
+        f'  <merchantid>{merchant_id}</merchantid>',
+        '  <offers>'
+    ]
 
     for it in items:
         if not it.get("enabled", True):
@@ -250,38 +255,31 @@ def build_kaspi_xml():
         if exclude_zero and total_stock <= 0:
             continue
 
-        offer = ET.SubElement(offers, "offer", {"sku": it["sku"]})
+        sku = escape_xml(it["sku"])
+        name = escape_xml(it["name"])
+        price = int(it.get("price", 0))
 
-        # Порядок тегов строго регламентирован схемой XSD:
-        # 1. model
-        model = ET.SubElement(offer, "model")
-        model.text = it["name"]
+        xml_lines.append(f'    <offer sku="{sku}">')
+        xml_lines.append(f'      <model>{name}</model>')
+        xml_lines.append('      <brand>Generic</brand>')
+        xml_lines.append('      <availabilities>')
 
-        # 2. brand
-        brand = ET.SubElement(offer, "brand")
-        brand.text = "Generic"
-
-        # 3. availabilities
-        availabilities = ET.SubElement(offer, "availabilities")
         for wh in warehouses:
             ratio = float(wh.get("ratio_percent", 0)) / 100.0
-            point_id = wh.get("point_id", "PP1").strip()
+            point_id = escape_xml(str(wh.get("point_id", "PP1")).strip())
             allocated_qty = int(total_stock * ratio)
+            avail_str = "yes" if allocated_qty > 0 else "no"
 
-            is_avail = "yes" if allocated_qty > 0 else "no"
-            ET.SubElement(availabilities, "availability", {
-                "available": is_avail,
-                "storeId": point_id,
-                "stock": str(allocated_qty)
-            })
+            xml_lines.append(f'        <availability available="{avail_str}" storeId="{point_id}" stock="{allocated_qty}"/>')
 
-        # 4. price
-        price = ET.SubElement(offer, "price")
-        price.text = str(int(it["price"]))
+        xml_lines.append('      </availabilities>')
+        xml_lines.append(f'      <price>{price}</price>')
+        xml_lines.append('    </offer>')
 
-    rough_str = ET.tostring(root, 'utf-8')
-    reparsed = minidom.parseString(rough_str)
-    return reparsed.toprettyxml(indent="  ", encoding="utf-8")
+    xml_lines.append('  </offers>')
+    xml_lines.append('</kaspi_catalog>')
+
+    return "\n".join(xml_lines)
 
 # ================= ВЕБ-ИНТЕРФЕЙС =================
 HTML_TEMPLATE = """
@@ -301,6 +299,9 @@ HTML_TEMPLATE = """
             --accent: #f97316;
             --accent-hover: #ea580c;
             --success: #10b981;
+            --success-hover: #059669;
+            --info: #0284c7;
+            --info-hover: #0369a1;
             --danger: #ef4444;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
@@ -324,14 +325,18 @@ HTML_TEMPLATE = """
         .wh-item { display: grid; grid-template-columns: 140px 1fr 100px 40px; gap: 10px; align-items: center; margin-bottom: 10px; background: #182234; padding: 10px; border-radius: 6px; }
         .btn-del { color: var(--danger); background: none; border: none; font-size: 18px; cursor: pointer; }
         
-        .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; }
+        .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; text-decoration: none; }
         .btn-success { background: var(--success); color: white; }
+        .btn-success:hover { background: var(--success-hover); }
         .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-info { background: var(--info); color: white; }
+        .btn-info:hover { background: var(--info-hover); }
         .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
         .btn-outline:hover { background: var(--border); }
         
-        .feed-box { background: #070a11; border: 1px dashed #374151; padding: 12px; border-radius: 6px; margin-top: 10px; word-break: break-all; }
-        .feed-box a { color: #38bdf8; text-decoration: none; font-family: monospace; font-size: 13px; }
+        .feed-box { display: flex; justify-content: space-between; align-items: center; background: #070a11; border: 1px dashed #374151; padding: 12px 16px; border-radius: 6px; margin-top: 10px; }
+        .feed-box a.feed-url { color: #38bdf8; text-decoration: none; font-family: monospace; font-size: 13px; word-break: break-all; }
         
         .table-container { max-height: 480px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; margin-top: 12px; }
         table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
@@ -358,12 +363,13 @@ HTML_TEMPLATE = """
     </header>
 
     <div class="card" style="border-color: #38bdf8;">
-        <h2>🔗 Ваша ссылка на XML-фид для кабинета Kaspi</h2>
+        <h2>🔗 Ссылка на фид и скачивание файла</h2>
         <div class="feed-box">
-            <a id="feedLink" href="/kaspi-feed.xml" target="_blank">Загрузка...</a>
+            <a id="feedLink" class="feed-url" href="/kaspi-feed.xml" target="_blank">Загрузка...</a>
+            <a href="/download-xml" class="btn btn-info" style="margin-left: 12px; white-space: nowrap;">📥 Скачать XML</a>
         </div>
-        <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
-            Вставьте эту ссылку в кабинете Kaspi: <b>Товары ➔ Настройка загрузки прайс-листа</b>.
+        <div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
+            Вставьте эту ссылку в кабинете Kaspi: <b>Товары ➔ Настройка загрузки прайс-листа</b> или скачайте файл для ручной загрузки/проверки.
         </div>
     </div>
 
@@ -593,11 +599,27 @@ def save_api():
 
 @app.route("/kaspi-feed.xml", methods=["GET"])
 def feed():
+    """Публичный фид для парсера Kaspi"""
     try:
         xml_res = build_kaspi_xml()
         return Response(xml_res, mimetype="application/xml; charset=utf-8")
     except Exception as e:
-        return Response(f"<error>{str(e)}</error>", status=500, mimetype="application/xml")
+        return Response(f"<error>{escape_xml(str(e))}</error>", status=500, mimetype="application/xml")
+
+@app.route("/download-xml", methods=["GET"])
+def download_xml():
+    """Скачивание сформированного XML файла на устройство"""
+    try:
+        xml_res = build_kaspi_xml()
+        return Response(
+            xml_res,
+            mimetype="application/xml; charset=utf-8",
+            headers={
+                "Content-Disposition": "attachment; filename=kaspi-feed.xml"
+            }
+        )
+    except Exception as e:
+        return Response(f"<error>{escape_xml(str(e))}</error>", status=500, mimetype="application/xml")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
