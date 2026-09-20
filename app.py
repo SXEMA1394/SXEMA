@@ -83,7 +83,25 @@ class X2PosClient:
             self.auth()
         return {"API-KEY": self.token}
 
+    def get_company_branches(self):
+        """Получение списка всех филиалов из настроек компании"""
+        url = f"{self.host}/api/company_settings"
+        resp = requests.get(url, headers=self._headers(), timeout=20)
+        if resp.status_code in (401, 403):
+            self.auth()
+            resp = requests.get(url, headers=self._headers(), timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        branch_ids = []
+        if isinstance(data, list) and len(data) > 0:
+            branches_dict = data[0].get("branches", {})
+            if isinstance(branches_dict, dict):
+                branch_ids = list(branches_dict.keys())
+        return branch_ids
+
     def get_products(self):
+        """Выгрузка всех вариаций с постраничной навигацией"""
         products = []
         page = 1
         while True:
@@ -102,7 +120,8 @@ class X2PosClient:
             page += 1
         return products
 
-    def get_stock(self, branch_id="all"):
+    def get_stock(self, branch_id):
+        """Получение остатков по конкретному ID филиала"""
         url = f"{self.host}/api/stock?branch_id={branch_id}"
         resp = requests.get(url, headers=self._headers(), timeout=20)
         resp.raise_for_status()
@@ -120,23 +139,36 @@ def run_full_sync():
         client = X2PosClient(X2POS_HOST, cfg["x2_user"], cfg["x2_pass"])
         client.auth()
 
-        raw_products = client.get_products()
-        raw_stock = client.get_stock("all")
+        # 1. Получаем список филиалов
+        branch_ids = client.get_company_branches()
+        print(f"[SYNC] Найдены филиалы компании: {branch_ids}")
 
-        # Универсальный парсинг остатков: X2pos может вернуть как dict, так и list
+        # 2. Опрашиваем каждый филиал и суммируем остатки
         stock_map = {}
-        if isinstance(raw_stock, dict):
-            for k, val in raw_stock.items():
-                if isinstance(val, dict):
-                    v_id = str(val.get("variation_id") or val.get("variation id") or k)
-                    stock_map[v_id] = float(val.get("quantity") or 0)
-        elif isinstance(raw_stock, list):
-            for row in raw_stock:
-                if isinstance(row, dict):
-                    v_id = str(row.get("variation_id") or row.get("variation id") or "")
-                    if v_id:
-                        stock_map[v_id] = stock_map.get(v_id, 0.0) + float(row.get("quantity") or 0)
+        for b_id in branch_ids:
+            try:
+                raw_stock = client.get_stock(b_id)
+                if isinstance(raw_stock, dict):
+                    for k, val in raw_stock.items():
+                        if isinstance(val, dict):
+                            # ID вариации может быть ключом словаря или лежать внутри
+                            v_id = str(val.get("variation_id") or val.get("variation id") or k).strip()
+                            qty = float(val.get("quantity") or 0)
+                            stock_map[v_id] = stock_map.get(v_id, 0.0) + qty
+                elif isinstance(raw_stock, list):
+                    for row in raw_stock:
+                        if isinstance(row, dict):
+                            v_id = str(row.get("variation_id") or row.get("variation id") or "").strip()
+                            if v_id:
+                                qty = float(row.get("quantity") or 0)
+                                stock_map[v_id] = stock_map.get(v_id, 0.0) + qty
+            except Exception as e:
+                print(f"[SYNC WARNING] Не удалось загрузить остатки филиала {b_id}: {e}")
 
+        print(f"[SYNC] Собрано уникальных позиций с остатками: {len(stock_map)}")
+
+        # 3. Выгружаем каталог товаров
+        raw_products = client.get_products()
         items = []
         overrides = cfg.get("products_override", {})
 
@@ -154,10 +186,10 @@ def run_full_sync():
             for var in variations:
                 if not isinstance(var, dict):
                     continue
-                var_id = str(var.get("id") or "")
+                var_id = str(var.get("id") or "").strip()
                 sku = (var.get("vendor_code") or parent_sku).strip()
 
-                # Учитываем только товары с артикулом
+                # Учитываем исключительно товары С АРТИКУЛОМ
                 if not sku:
                     continue
 
@@ -184,7 +216,7 @@ def run_full_sync():
         items.sort(key=lambda x: x["sku"])
         save_cached_items(items)
         sync_status_message = f"Успешно синхронизировано ({len(items)} товаров)"
-        print(f"[SYNC SUCCESS] Загружено товаров: {len(items)}")
+        print(f"[SYNC SUCCESS] Каталог обновлен. Всего товаров с артикулом: {len(items)}")
     except Exception as e:
         sync_status_message = f"Ошибка синхронизации: {str(e)}"
         print(f"[SYNC ERROR] {e}")
@@ -491,7 +523,6 @@ HTML_TEMPLATE = """
         fetch("/api/sync", { method: "POST" })
         .then(r => r.json())
         .then(() => {
-            // Опрашиваем состояние раз в 2 секунды
             const poll = setInterval(() => {
                 fetch("/api/status")
                 .then(r => r.json())
