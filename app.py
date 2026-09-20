@@ -4,6 +4,7 @@ import time
 import threading
 import traceback
 import requests
+from datetime import datetime
 from flask import Flask, Response, render_template_string, request, jsonify
 
 CONFIG_FILE = "config.json"
@@ -14,11 +15,12 @@ DEFAULT_CONFIG = {
     "x2_user": os.getenv("X2POS_USER", "aiberasting@gmail.com"),
     "x2_pass": os.getenv("X2POS_PASS", "Pavelo31"),
     "exclude_zero_stock": True,
-    "merchant_id": "YOUR_MERCHANT_ID",
-    "company_name": "Kaspi Store",
+    "merchant_id": "30210258",
+    "company_name": "30210258",
+    "city_ids": "750000000, 195220100",  # Коды городов через запятую (750000000 - Алматы)
     "kaspi_warehouses": [
-        {"point_id": "PP1", "name": "Склад Алматы", "ratio_percent": 60},
-        {"point_id": "PP2", "name": "Склад Регионы", "ratio_percent": 40}
+        {"point_id": "30210258_PP1", "name": "Склад Алматы (PP1)", "ratio_percent": 60},
+        {"point_id": "30210258_QASQELEN", "name": "Склад Каскелен", "ratio_percent": 40}
     ],
     "products_override": {}  # sku: {"enabled": bool}
 }
@@ -59,7 +61,6 @@ def save_cached_items(items):
         json.dump(items, f, ensure_ascii=False, indent=2)
 
 def escape_xml(text):
-    """Экранирование спецсимволов для XML"""
     if text is None:
         return ""
     text = str(text)
@@ -146,7 +147,7 @@ def run_full_sync():
         client.auth()
 
         branch_ids = client.get_company_branches()
-        print(f"[SYNC] Филиалы: {branch_ids}")
+        print(f"[SYNC] Филиалы X2pos: {branch_ids}")
 
         stock_map = {}
         for b_id in branch_ids:
@@ -166,7 +167,7 @@ def run_full_sync():
                                 qty = float(row.get("quantity") or 0)
                                 stock_map[v_id] = stock_map.get(v_id, 0.0) + qty
             except Exception as e:
-                print(f"[SYNC WARNING] Ошибка загрузки остатков филиала {b_id}: {e}")
+                print(f"[SYNC WARNING] Ошибка остатков филиала {b_id}: {e}")
 
         raw_products = client.get_products()
         items = []
@@ -177,6 +178,7 @@ def run_full_sync():
                 continue
 
             parent_sku = (prod.get("product_vendor_code") or "").strip()
+            brand = (prod.get("product_brand") or "Generic").strip()
             variations = prod.get("variations") or []
             if isinstance(variations, dict):
                 variations = list(variations.values())
@@ -207,6 +209,7 @@ def run_full_sync():
                     "sku": sku,
                     "var_id": var_id,
                     "name": name,
+                    "brand": brand,
                     "price": price,
                     "stock": qty,
                     "enabled": is_enabled
@@ -224,7 +227,7 @@ def run_full_sync():
         is_syncing = False
         sync_lock.release()
 
-# ================= ВАЛИДНЫЙ ГЕНЕРАТОР KASPI XML =================
+# ================= ТОЧНЫЙ ГЕНЕРАТОР ПО ОБРАЗЦУ KASPI =================
 def build_kaspi_xml():
     cfg = load_config()
     items = load_cached_items()
@@ -236,15 +239,24 @@ def build_kaspi_xml():
     warehouses = cfg.get("kaspi_warehouses", [])
     exclude_zero = cfg.get("exclude_zero_stock", False)
 
-    company_name = escape_xml(cfg.get("company_name", "Kaspi Store"))
-    merchant_id = escape_xml(cfg.get("merchant_id", "MERCHANT_ID"))
+    company = escape_xml(cfg.get("company_name", "30210258"))
+    merchantid = escape_xml(cfg.get("merchant_id", "30210258"))
+    
+    # Парсим ID городов
+    raw_cities = cfg.get("city_ids", "750000000")
+    city_list = [c.strip() for c in raw_cities.split(",") if c.strip()]
+    if not city_list:
+        city_list = ["750000000"]
 
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Формируем заголовок идентично образцу
     xml_lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<kaspi_catalog date="string" xmlns="kaspi_catalog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="kaspi_catalog kaspi_catalog.xsd">',
-        f'  <company>{company_name}</company>',
-        f'  <merchantid>{merchant_id}</merchantid>',
-        '  <offers>'
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<kaspi_catalog xmlns="kaspiShopping" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://kaspi.kz/kaspishopping.xsd" date="{now_str}">',
+        f'    <company>{company}</company>',
+        f'    <merchantid>{merchantid}</merchantid>',
+        '    <offers>'
     ]
 
     for it in items:
@@ -257,26 +269,33 @@ def build_kaspi_xml():
 
         sku = escape_xml(it["sku"])
         name = escape_xml(it["name"])
+        brand = escape_xml(it.get("brand") or "Generic")
         price = int(it.get("price", 0))
 
-        xml_lines.append(f'    <offer sku="{sku}">')
-        xml_lines.append(f'      <model>{name}</model>')
-        xml_lines.append('      <brand>Generic</brand>')
-        xml_lines.append('      <availabilities>')
+        xml_lines.append(f'        <offer sku="{sku}">')
+        xml_lines.append(f'            <model>{name}</model>')
+        xml_lines.append(f'            <brand>{brand}</brand>')
+        xml_lines.append('            <availabilities>')
 
         for wh in warehouses:
             ratio = float(wh.get("ratio_percent", 0)) / 100.0
             point_id = escape_xml(str(wh.get("point_id", "PP1")).strip())
             allocated_qty = int(total_stock * ratio)
-            avail_str = "yes" if allocated_qty > 0 else "no"
 
-            xml_lines.append(f'        <availability available="{avail_str}" storeId="{point_id}" stock="{allocated_qty}"/>')
+            if allocated_qty > 0:
+                xml_lines.append(f'                <availability available="yes" storeId="{point_id}" preOrder="0" stockCount="{allocated_qty}.0"/>')
+            else:
+                xml_lines.append(f'                <availability available="no" storeId="{point_id}" preOrder="0"/>')
 
-        xml_lines.append('      </availabilities>')
-        xml_lines.append(f'      <price>{price}</price>')
-        xml_lines.append('    </offer>')
+        xml_lines.append('            </availabilities>')
+        xml_lines.append('            <cityprices>')
+        for cid in city_list:
+            cid_escaped = escape_xml(cid)
+            xml_lines.append(f'                <cityprice cityId="{cid_escaped}">{price}</cityprice>')
+        xml_lines.append('            </cityprices>')
+        xml_lines.append('        </offer>')
 
-    xml_lines.append('  </offers>')
+    xml_lines.append('    </offers>')
     xml_lines.append('</kaspi_catalog>')
 
     return "\n".join(xml_lines)
@@ -322,7 +341,7 @@ HTML_TEMPLATE = """
         }
         input:focus { border-color: var(--accent); }
         
-        .wh-item { display: grid; grid-template-columns: 140px 1fr 100px 40px; gap: 10px; align-items: center; margin-bottom: 10px; background: #182234; padding: 10px; border-radius: 6px; }
+        .wh-item { display: grid; grid-template-columns: 160px 1fr 90px 40px; gap: 10px; align-items: center; margin-bottom: 10px; background: #182234; padding: 10px; border-radius: 6px; }
         .btn-del { color: var(--danger); background: none; border: none; font-size: 18px; cursor: pointer; }
         
         .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; text-decoration: none; }
@@ -352,8 +371,8 @@ HTML_TEMPLATE = """
 <div class="container">
     <header>
         <div>
-            <h1>Синхронизация X2POS ➔ Склады Kaspi</h1>
-            <div style="color: var(--text-muted); font-size: 12px;">Фильтрация по артикулу, управление долями складов Kaspi и XML-фид</div>
+            <h1>Синхронизация X2POS ➔ Kaspi (kaspiShopping XML)</h1>
+            <div style="color: var(--text-muted); font-size: 12px;">Строгая схема kaspishopping.xsd, склады, цены по городам и остатки</div>
         </div>
         <div class="btn-group">
             <span id="statusLabel">{{ status_msg }}</span>
@@ -369,23 +388,26 @@ HTML_TEMPLATE = """
             <a href="/download-xml" class="btn btn-info" style="margin-left: 12px; white-space: nowrap;">📥 Скачать XML</a>
         </div>
         <div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
-            Вставьте эту ссылку в кабинете Kaspi: <b>Товары ➔ Настройка загрузки прайс-листа</b> или скачайте файл для ручной загрузки/проверки.
+            Вставьте эту ссылку в кабинете Kaspi: <b>Товары ➔ Загрузка прайс-листа</b>.
         </div>
     </div>
 
     <div class="grid-2">
         <div class="card">
-            <h2>🏢 Магазин Kaspi & Фильтры</h2>
+            <h2>🏢 Магазин Kaspi & Города</h2>
             <div style="margin-bottom: 10px;">
-                <label>Merchant ID (ID продавца Kaspi)</label>
-                <input type="text" id="merchantId" value="{{ config.merchant_id }}" onchange="cfg.merchant_id = this.value">
+                <label>Merchant ID / Company (ID продавца Kaspi)</label>
+                <input type="text" id="merchantId" value="{{ config.merchant_id }}" onchange="cfg.merchant_id = this.value; cfg.company_name = this.value;">
             </div>
             <div style="margin-bottom: 10px;">
-                <label>Название магазина</label>
-                <input type="text" id="companyName" value="{{ config.company_name }}" onchange="cfg.company_name = this.value">
+                <label>ID Городов присутствия (через запятую)</label>
+                <input type="text" id="cityIds" value="{{ config.city_ids }}" onchange="cfg.city_ids = this.value" placeholder="750000000, 195220100">
+                <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
+                    750000000 — Алматы, 195220100 — Каскелен, 710000000 — Астана
+                </div>
             </div>
             
-            <label class="checkbox-row" style="margin-top: 16px;">
+            <label class="checkbox-row" style="margin-top: 14px;">
                 <input type="checkbox" id="excludeZero" {% if config.exclude_zero_stock %}checked{% endif %} onchange="cfg.exclude_zero_stock = this.checked">
                 <span style="font-weight: 600; color: #fbbf24;">Снять с публикации товары с 0 остатком</span>
             </label>
@@ -398,7 +420,7 @@ HTML_TEMPLATE = """
             </h2>
             <div id="whContainer"></div>
             <div style="font-size: 11px; color: var(--text-muted); margin-top: 8px;">
-                * Point ID склада (например: <b>PP1</b>, <b>PP2</b>) берется из настроек Kaspi. Доли рассчитываются пропорционально.
+                * storeId указывать строго как в Kaspi (например: <b>30210258_PP1</b>, <b>30210258_QASQELEN</b>, <b>30210258_NOEXPRESS</b>).
             </div>
         </div>
     </div>
@@ -415,11 +437,12 @@ HTML_TEMPLATE = """
                 <thead>
                     <tr>
                         <th width="40"><input type="checkbox" onclick="bulkToggle(this.checked)"></th>
-                        <th width="140">Артикул (SKU)</th>
+                        <th width="160">Артикул (SKU)</th>
                         <th>Наименование</th>
-                        <th width="110">Цена</th>
+                        <th width="110">Бренд</th>
+                        <th width="100">Цена</th>
                         <th width="90">Остаток X2</th>
-                        <th width="120">Статус</th>
+                        <th width="110">Статус</th>
                     </tr>
                 </thead>
                 <tbody id="pBody"></tbody>
@@ -446,7 +469,7 @@ HTML_TEMPLATE = """
             const div = document.createElement("div");
             div.className = "wh-item";
             div.innerHTML = `
-                <input type="text" placeholder="Point ID (PP1)" value="${wh.point_id}" onchange="wh.point_id=this.value">
+                <input type="text" placeholder="storeId (30210258_PP1)" value="${wh.point_id}" onchange="wh.point_id=this.value">
                 <input type="text" placeholder="Название склада" value="${wh.name}" onchange="wh.name=this.value">
                 <input type="number" min="0" max="100" placeholder="%" value="${wh.ratio_percent}" onchange="wh.ratio_percent=Number(this.value)">
                 <button class="btn-del" onclick="deleteWarehouse(${idx})">&times;</button>
@@ -456,7 +479,8 @@ HTML_TEMPLATE = """
     }
 
     function addWarehouse() {
-        cfg.kaspi_warehouses.push({ point_id: "PP" + (cfg.kaspi_warehouses.length + 1), name: "Новый склад", ratio_percent: 50 });
+        const prefix = cfg.merchant_id ? (cfg.merchant_id + "_") : "";
+        cfg.kaspi_warehouses.push({ point_id: prefix + "PP" + (cfg.kaspi_warehouses.length + 1), name: "Новый склад", ratio_percent: 50 });
         renderWarehouses();
     }
 
@@ -476,6 +500,7 @@ HTML_TEMPLATE = """
                 <td><input type="checkbox" class="p-cb" data-sku="${p.sku}" ${p.enabled ? 'checked' : ''} onchange="toggleItem('${p.sku}', this.checked)"></td>
                 <td style="font-weight: 600; color: #38bdf8;">${p.sku}</td>
                 <td>${p.name}</td>
+                <td style="color: #9ca3af;">${p.brand || 'Generic'}</td>
                 <td>${p.price.toLocaleString()} ₸</td>
                 <td style="font-weight: 700; color: ${p.stock > 0 ? '#10b981' : '#ef4444'}">${p.stock} шт</td>
                 <td><span style="font-size: 11px; padding: 2px 6px; border-radius: 4px; background: ${p.enabled ? '#065f46' : '#7f1d1d'}">${p.enabled ? 'В фиде' : 'Выключен'}</span></td>
@@ -599,7 +624,6 @@ def save_api():
 
 @app.route("/kaspi-feed.xml", methods=["GET"])
 def feed():
-    """Публичный фид для парсера Kaspi"""
     try:
         xml_res = build_kaspi_xml()
         return Response(xml_res, mimetype="application/xml; charset=utf-8")
@@ -608,7 +632,6 @@ def feed():
 
 @app.route("/download-xml", methods=["GET"])
 def download_xml():
-    """Скачивание сформированного XML файла на устройство"""
     try:
         xml_res = build_kaspi_xml()
         return Response(
