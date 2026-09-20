@@ -227,7 +227,7 @@ def run_full_sync():
         is_syncing = False
         sync_lock.release()
 
-# ================= ТОЧНЫЙ ГЕНЕРАТОР ПО ОБРАЗЦУ KASPI =================
+# ================= ГЕНЕРАЦИЯ KASPI XML =================
 def build_kaspi_xml():
     cfg = load_config()
     items = load_cached_items()
@@ -242,7 +242,6 @@ def build_kaspi_xml():
     company = escape_xml(cfg.get("company_name", "30210258"))
     merchantid = escape_xml(cfg.get("merchant_id", "30210258"))
     
-    # Парсим ID городов
     raw_cities = cfg.get("city_ids", "750000000")
     city_list = [c.strip() for c in raw_cities.split(",") if c.strip()]
     if not city_list:
@@ -250,7 +249,6 @@ def build_kaspi_xml():
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Формируем заголовок идентично образцу
     xml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>'
         f'<kaspi_catalog xmlns="kaspiShopping" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://kaspi.kz/kaspishopping.xsd" date="{now_str}">',
@@ -397,18 +395,18 @@ HTML_TEMPLATE = """
             <h2>🏢 Магазин Kaspi & Города</h2>
             <div style="margin-bottom: 10px;">
                 <label>Merchant ID / Company (ID продавца Kaspi)</label>
-                <input type="text" id="merchantId" value="{{ config.merchant_id }}" onchange="cfg.merchant_id = this.value; cfg.company_name = this.value;">
+                <input type="text" id="merchantId" value="{{ config.merchant_id }}">
             </div>
             <div style="margin-bottom: 10px;">
                 <label>ID Городов присутствия (через запятую)</label>
-                <input type="text" id="cityIds" value="{{ config.city_ids }}" onchange="cfg.city_ids = this.value" placeholder="750000000, 195220100">
+                <input type="text" id="cityIds" value="{{ config.city_ids }}" placeholder="750000000, 195220100">
                 <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
                     750000000 — Алматы, 195220100 — Каскелен, 710000000 — Астана
                 </div>
             </div>
             
             <label class="checkbox-row" style="margin-top: 14px;">
-                <input type="checkbox" id="excludeZero" {% if config.exclude_zero_stock %}checked{% endif %} onchange="cfg.exclude_zero_stock = this.checked">
+                <input type="checkbox" id="excludeZero" {% if config.exclude_zero_stock %}checked{% endif %}>
                 <span style="font-weight: 600; color: #fbbf24;">Снять с публикации товары с 0 остатком</span>
             </label>
         </div>
@@ -469,9 +467,9 @@ HTML_TEMPLATE = """
             const div = document.createElement("div");
             div.className = "wh-item";
             div.innerHTML = `
-                <input type="text" placeholder="storeId (30210258_PP1)" value="${wh.point_id}" onchange="wh.point_id=this.value">
-                <input type="text" placeholder="Название склада" value="${wh.name}" onchange="wh.name=this.value">
-                <input type="number" min="0" max="100" placeholder="%" value="${wh.ratio_percent}" onchange="wh.ratio_percent=Number(this.value)">
+                <input type="text" class="wh-point-id" placeholder="storeId" value="${wh.point_id || ''}" oninput="cfg.kaspi_warehouses[${idx}].point_id=this.value">
+                <input type="text" class="wh-name" placeholder="Название склада" value="${wh.name || ''}" oninput="cfg.kaspi_warehouses[${idx}].name=this.value">
+                <input type="number" class="wh-ratio" min="0" max="100" placeholder="%" value="${wh.ratio_percent}" oninput="cfg.kaspi_warehouses[${idx}].ratio_percent=Number(this.value)">
                 <button class="btn-del" onclick="deleteWarehouse(${idx})">&times;</button>
             `;
             box.appendChild(div);
@@ -479,14 +477,29 @@ HTML_TEMPLATE = """
     }
 
     function addWarehouse() {
-        const prefix = cfg.merchant_id ? (cfg.merchant_id + "_") : "";
+        // Синхронизируем текущее состояние перед добавлением
+        collectWarehousesFromDOM();
+        const prefix = document.getElementById("merchantId").value ? (document.getElementById("merchantId").value + "_") : "";
         cfg.kaspi_warehouses.push({ point_id: prefix + "PP" + (cfg.kaspi_warehouses.length + 1), name: "Новый склад", ratio_percent: 50 });
         renderWarehouses();
     }
 
     function deleteWarehouse(idx) {
+        collectWarehousesFromDOM();
         cfg.kaspi_warehouses.splice(idx, 1);
         renderWarehouses();
+    }
+
+    function collectWarehousesFromDOM() {
+        const items = document.querySelectorAll("#whContainer .wh-item");
+        const newWarehouses = [];
+        items.forEach(el => {
+            const pId = el.querySelector(".wh-point-id").value.trim();
+            const name = el.querySelector(".wh-name").value.trim();
+            const ratio = Number(el.querySelector(".wh-ratio").value) || 0;
+            newWarehouses.push({ point_id: pId, name: name, ratio_percent: ratio });
+        });
+        cfg.kaspi_warehouses = newWarehouses;
     }
 
     function renderProducts() {
@@ -533,6 +546,13 @@ HTML_TEMPLATE = """
     }
 
     function saveAll() {
+        // Принудительно вычитываем актуальные данные из инпутов в объект cfg
+        collectWarehousesFromDOM();
+        cfg.merchant_id = document.getElementById("merchantId").value.trim();
+        cfg.company_name = cfg.merchant_id;
+        cfg.city_ids = document.getElementById("cityIds").value.trim();
+        cfg.exclude_zero_stock = document.getElementById("excludeZero").checked;
+
         fetch("/api/save", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
@@ -541,10 +561,14 @@ HTML_TEMPLATE = """
         .then(r => r.json())
         .then(res => {
             if(res.status === "ok") {
-                alert("Настройки сохранены!");
+                alert("Настройки успешно сохранены!");
+                location.reload();
             } else {
                 alert("Ошибка: " + res.message);
             }
+        })
+        .catch(err => {
+            alert("Ошибка сети при сохранении: " + err);
         });
     }
 
