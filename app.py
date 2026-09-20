@@ -84,7 +84,6 @@ class X2PosClient:
         return {"API-KEY": self.token}
 
     def get_company_branches(self):
-        """Получение списка всех филиалов из настроек компании"""
         url = f"{self.host}/api/company_settings"
         resp = requests.get(url, headers=self._headers(), timeout=20)
         if resp.status_code in (401, 403):
@@ -101,7 +100,6 @@ class X2PosClient:
         return branch_ids
 
     def get_products(self):
-        """Выгрузка всех вариаций с постраничной навигацией"""
         products = []
         page = 1
         while True:
@@ -121,7 +119,6 @@ class X2PosClient:
         return products
 
     def get_stock(self, branch_id):
-        """Получение остатков по конкретному ID филиала"""
         url = f"{self.host}/api/stock?branch_id={branch_id}"
         resp = requests.get(url, headers=self._headers(), timeout=20)
         resp.raise_for_status()
@@ -139,11 +136,9 @@ def run_full_sync():
         client = X2PosClient(X2POS_HOST, cfg["x2_user"], cfg["x2_pass"])
         client.auth()
 
-        # 1. Получаем список филиалов
         branch_ids = client.get_company_branches()
-        print(f"[SYNC] Найдены филиалы компании: {branch_ids}")
+        print(f"[SYNC] Филиалы: {branch_ids}")
 
-        # 2. Опрашиваем каждый филиал и суммируем остатки
         stock_map = {}
         for b_id in branch_ids:
             try:
@@ -151,7 +146,6 @@ def run_full_sync():
                 if isinstance(raw_stock, dict):
                     for k, val in raw_stock.items():
                         if isinstance(val, dict):
-                            # ID вариации может быть ключом словаря или лежать внутри
                             v_id = str(val.get("variation_id") or val.get("variation id") or k).strip()
                             qty = float(val.get("quantity") or 0)
                             stock_map[v_id] = stock_map.get(v_id, 0.0) + qty
@@ -165,9 +159,6 @@ def run_full_sync():
             except Exception as e:
                 print(f"[SYNC WARNING] Не удалось загрузить остатки филиала {b_id}: {e}")
 
-        print(f"[SYNC] Собрано уникальных позиций с остатками: {len(stock_map)}")
-
-        # 3. Выгружаем каталог товаров
         raw_products = client.get_products()
         items = []
         overrides = cfg.get("products_override", {})
@@ -189,7 +180,6 @@ def run_full_sync():
                 var_id = str(var.get("id") or "").strip()
                 sku = (var.get("vendor_code") or parent_sku).strip()
 
-                # Учитываем исключительно товары С АРТИКУЛОМ
                 if not sku:
                     continue
 
@@ -216,7 +206,7 @@ def run_full_sync():
         items.sort(key=lambda x: x["sku"])
         save_cached_items(items)
         sync_status_message = f"Успешно синхронизировано ({len(items)} товаров)"
-        print(f"[SYNC SUCCESS] Каталог обновлен. Всего товаров с артикулом: {len(items)}")
+        print(f"[SYNC SUCCESS] Загружено товаров: {len(items)}")
     except Exception as e:
         sync_status_message = f"Ошибка синхронизации: {str(e)}"
         print(f"[SYNC ERROR] {e}")
@@ -225,6 +215,7 @@ def run_full_sync():
         is_syncing = False
         sync_lock.release()
 
+# ================= ГЕНЕРАЦИЯ ВАЛИДНОГО KASPI XML =================
 def build_kaspi_xml():
     cfg = load_config()
     items = load_cached_items()
@@ -236,9 +227,12 @@ def build_kaspi_xml():
     warehouses = cfg.get("kaspi_warehouses", [])
     exclude_zero = cfg.get("exclude_zero_stock", False)
 
+    # Строгое соответствие XSD-схеме Kaspi Goods
     root = ET.Element("kaspi_catalog", {
-        "date": time.strftime("%Y-%m-%d %H:%M"),
-        "xmlns": "kaspi_catalog"
+        "date": "string",
+        "xmlns": "kaspi_catalog",
+        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+        "xsi:schemaLocation": "kaspi_catalog kaspi_catalog.xsd"
     })
     
     company = ET.SubElement(root, "company")
@@ -257,13 +251,17 @@ def build_kaspi_xml():
             continue
 
         offer = ET.SubElement(offers, "offer", {"sku": it["sku"]})
+
+        # Порядок тегов строго регламентирован схемой XSD:
+        # 1. model
         model = ET.SubElement(offer, "model")
         model.text = it["name"]
+
+        # 2. brand
         brand = ET.SubElement(offer, "brand")
         brand.text = "Generic"
-        price = ET.SubElement(offer, "price")
-        price.text = str(int(it["price"]))
 
+        # 3. availabilities
         availabilities = ET.SubElement(offer, "availabilities")
         for wh in warehouses:
             ratio = float(wh.get("ratio_percent", 0)) / 100.0
@@ -277,8 +275,13 @@ def build_kaspi_xml():
                 "stock": str(allocated_qty)
             })
 
+        # 4. price
+        price = ET.SubElement(offer, "price")
+        price.text = str(int(it["price"]))
+
     rough_str = ET.tostring(root, 'utf-8')
-    return minidom.parseString(rough_str).toprettyxml(indent="  ", encoding="utf-8")
+    reparsed = minidom.parseString(rough_str)
+    return reparsed.toprettyxml(indent="  ", encoding="utf-8")
 
 # ================= ВЕБ-ИНТЕРФЕЙС =================
 HTML_TEMPLATE = """
