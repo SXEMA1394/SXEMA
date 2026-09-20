@@ -2,6 +2,7 @@ import os
 import json
 import time
 import threading
+import traceback
 import requests
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -27,6 +28,7 @@ DEFAULT_CONFIG = {
 app = Flask(__name__)
 sync_lock = threading.Lock()
 is_syncing = False
+sync_status_message = "Готов к работе"
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -108,47 +110,65 @@ class X2PosClient:
 
 # ================= СБОРКА И ОБНОВЛЕНИЕ ДАННЫХ =================
 def run_full_sync():
-    """Фоновое обновление товаров и остатков из X2pos"""
-    global is_syncing
+    global is_syncing, sync_status_message
     if not sync_lock.acquire(blocking=False):
         return
     try:
         is_syncing = True
+        sync_status_message = "Идет синхронизация с X2pos..."
         cfg = load_config()
         client = X2PosClient(X2POS_HOST, cfg["x2_user"], cfg["x2_pass"])
         client.auth()
 
         raw_products = client.get_products()
-        stock_data = client.get_stock("all")
+        raw_stock = client.get_stock("all")
+
+        # Универсальный парсинг остатков: X2pos может вернуть как dict, так и list
+        stock_map = {}
+        if isinstance(raw_stock, dict):
+            for k, val in raw_stock.items():
+                if isinstance(val, dict):
+                    v_id = str(val.get("variation_id") or val.get("variation id") or k)
+                    stock_map[v_id] = float(val.get("quantity") or 0)
+        elif isinstance(raw_stock, list):
+            for row in raw_stock:
+                if isinstance(row, dict):
+                    v_id = str(row.get("variation_id") or row.get("variation id") or "")
+                    if v_id:
+                        stock_map[v_id] = stock_map.get(v_id, 0.0) + float(row.get("quantity") or 0)
 
         items = []
         overrides = cfg.get("products_override", {})
 
         for prod in raw_products:
-            if prod.get("is_service") == "1":
+            if not isinstance(prod, dict) or prod.get("is_service") == "1":
                 continue
 
             parent_sku = (prod.get("product_vendor_code") or "").strip()
-            variations = prod.get("variations", [])
+            variations = prod.get("variations") or []
             if isinstance(variations, dict):
                 variations = list(variations.values())
+            elif not isinstance(variations, list):
+                variations = []
 
             for var in variations:
-                var_id = str(var.get("id"))
+                if not isinstance(var, dict):
+                    continue
+                var_id = str(var.get("id") or "")
                 sku = (var.get("vendor_code") or parent_sku).strip()
 
                 # Учитываем только товары с артикулом
                 if not sku:
                     continue
 
-                name = prod.get("product_name", "")
+                name = prod.get("product_name") or ""
                 var_name = var.get("name")
-                if var_name and var_name.lower() != "generic":
+                if var_name and str(var_name).lower() != "generic":
                     name = f"{name} ({var_name})"
 
                 price = float(var.get("retail_price") or 0.0)
-                raw_qty = stock_data.get(var_id, {}).get("quantity", 0)
-                qty = max(0, int(float(raw_qty)))
+                raw_qty = stock_map.get(var_id, 0.0)
+                qty = max(0, int(raw_qty))
 
                 is_enabled = overrides.get(sku, {}).get("enabled", True)
 
@@ -163,8 +183,12 @@ def run_full_sync():
 
         items.sort(key=lambda x: x["sku"])
         save_cached_items(items)
+        sync_status_message = f"Успешно синхронизировано ({len(items)} товаров)"
+        print(f"[SYNC SUCCESS] Загружено товаров: {len(items)}")
     except Exception as e:
+        sync_status_message = f"Ошибка синхронизации: {str(e)}"
         print(f"[SYNC ERROR] {e}")
+        traceback.print_exc()
     finally:
         is_syncing = False
         sync_lock.release()
@@ -173,7 +197,6 @@ def build_kaspi_xml():
     cfg = load_config()
     items = load_cached_items()
     
-    # Если локальный кеш ещё пуст — запускаем синхронную первую загрузку
     if not items:
         run_full_sync()
         items = load_cached_items()
@@ -251,7 +274,7 @@ HTML_TEMPLATE = """
         
         header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
         h1 { font-size: 22px; color: var(--accent); }
-        .btn-group { display: flex; gap: 10px; }
+        .btn-group { display: flex; gap: 10px; align-items: center; }
         
         .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
         .card h2 { font-size: 16px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
@@ -282,6 +305,7 @@ HTML_TEMPLATE = """
         
         .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-top: 10px; cursor: pointer; }
         .checkbox-row input { cursor: pointer; width: 16px; height: 16px; }
+        #statusLabel { font-size: 12px; color: #38bdf8; margin-right: 8px; }
     </style>
 </head>
 <body>
@@ -292,7 +316,8 @@ HTML_TEMPLATE = """
             <div style="color: var(--text-muted); font-size: 12px;">Фильтрация по артикулу, управление долями складов Kaspi и XML-фид</div>
         </div>
         <div class="btn-group">
-            <button class="btn btn-primary" onclick="triggerSync()">🔄 Обновить из X2pos</button>
+            <span id="statusLabel">{{ status_msg }}</span>
+            <button class="btn btn-primary" id="syncBtn" onclick="triggerSync()">🔄 Обновить из X2pos</button>
             <button class="btn btn-success" onclick="saveAll()">💾 Сохранить настройки</button>
         </div>
     </header>
@@ -371,11 +396,6 @@ HTML_TEMPLATE = """
         document.getElementById("feedLink").href = window.location.origin + "/kaspi-feed.xml";
         renderWarehouses();
         renderProducts();
-        
-        // Если при первом открытии список пуст, запускаем фоновую синхронизацию
-        if (!products || products.length === 0) {
-            triggerSync(true);
-        }
     }
 
     function renderWarehouses() {
@@ -462,12 +482,32 @@ HTML_TEMPLATE = """
         });
     }
 
-    function triggerSync(silent=false) {
-        if (!silent) alert("Синхронизация с X2pos запущена в фоне. Страница обновится через несколько секунд.");
+    function triggerSync() {
+        const btn = document.getElementById("syncBtn");
+        const status = document.getElementById("statusLabel");
+        btn.disabled = true;
+        status.innerText = "Синхронизация запущена...";
+
         fetch("/api/sync", { method: "POST" })
         .then(r => r.json())
-        .then(res => {
-            setTimeout(() => { location.reload(); }, 4000);
+        .then(() => {
+            // Опрашиваем состояние раз в 2 секунды
+            const poll = setInterval(() => {
+                fetch("/api/status")
+                .then(r => r.json())
+                .then(data => {
+                    status.innerText = data.message;
+                    if (!data.is_syncing) {
+                        clearInterval(poll);
+                        btn.disabled = false;
+                        location.reload();
+                    }
+                });
+            }, 2000);
+        })
+        .catch(err => {
+            status.innerText = "Ошибка: " + err;
+            btn.disabled = false;
         });
     }
 
@@ -480,7 +520,6 @@ HTML_TEMPLATE = """
 # ================= ЭНДПОИНТЫ =================
 @app.route("/healthz", methods=["GET"])
 def health_check():
-    """Мгновенный ответ для health check платформы Render"""
     return "OK", 200
 
 @app.route("/", methods=["GET"])
@@ -491,7 +530,8 @@ def index():
         HTML_TEMPLATE,
         config=cfg,
         config_json=json.dumps(cfg),
-        products_json=json.dumps(items)
+        products_json=json.dumps(items),
+        status_msg=sync_status_message
     )
 
 @app.route("/api/sync", methods=["POST"])
@@ -500,6 +540,13 @@ def sync_api():
     thread.daemon = True
     thread.start()
     return jsonify({"status": "started"})
+
+@app.route("/api/status", methods=["GET"])
+def status_api():
+    return jsonify({
+        "is_syncing": is_syncing,
+        "message": sync_status_message
+    })
 
 @app.route("/api/save", methods=["POST"])
 def save_api():
